@@ -107,6 +107,28 @@ func TestDependabotMinutesAreFreeInAPrivateRepository(t *testing.T) {
 	}
 }
 
+func TestAJobAlreadyMovedIsASavingMadeNotOneToMake(t *testing.T) {
+	runs := []runWithJobs{
+		// The suite ran on GitHub's runners, then moved to our own.
+		oneRun(ranJob("Tests", "suite", 0, 0, mins(10), true)),
+		oneRun(ranJob("Tests", "suite", mins(60), 0, mins(10), false)),
+		// The publish job never moved.
+		oneRun(ranJob("Publish", "fetch", mins(30), 0, mins(2), true)),
+	}
+
+	cost := costOf(jobRecords(runs), nil, 24*time.Hour, false)
+
+	if math.Abs(cost.HostedUSD-0.072) > 1e-9 {
+		t.Errorf("hosted cost = %v, want 0.072 for both jobs' hosted runs", cost.HostedUSD)
+	}
+	if math.Abs(cost.StillHostedUSD-0.012) > 1e-9 || cost.StillHostedMinutes != 2 {
+		t.Errorf("still hosted = %v over %d min, want 0.012 over 2, the publish job alone", cost.StillHostedUSD, cost.StillHostedMinutes)
+	}
+	if math.Abs(cost.MovedUSD-0.06) > 1e-9 || len(cost.MovedJobs) != 1 || cost.MovedJobs[0] != "Tests / suite" {
+		t.Errorf("moved = %v for %v, want 0.06 for Tests / suite", cost.MovedUSD, cost.MovedJobs)
+	}
+}
+
 func TestJobsThatNeverReachedARunnerAreNotCounted(t *testing.T) {
 	skipped := workflowJob{
 		Name: "deploy", WorkflowName: "Tests", Conclusion: "skipped",
@@ -294,6 +316,26 @@ func TestCancelledBeforeStartCountsOnlyRunsNoRunnerTouched(t *testing.T) {
 		if c.Event == "push" && !c.DefaultBranch {
 			t.Errorf("push run on develop not marked as the default branch: %+v", c)
 		}
+	}
+}
+
+func TestDefaultBranchCancellationsComeBeforePullRequests(t *testing.T) {
+	var runs []runWithJobs
+	for range 5 {
+		runs = append(runs, runWithJobs{Run: workflowRun{Name: "Tests", Event: "pull_request", HeadBranch: "feature", Conclusion: "cancelled"}})
+	}
+	runs = append(runs, runWithJobs{Run: workflowRun{Name: "Tests", Event: "push", HeadBranch: "main", Conclusion: "cancelled"}})
+	runs = append(runs, runWithJobs{Run: workflowRun{Name: "Tests", Event: "push", HeadBranch: "release", Conclusion: "cancelled"}})
+
+	got := cancelledBeforeStart(runs, "main")
+
+	if len(got) != 3 {
+		t.Fatalf("groups = %+v, want 3", got)
+	}
+	// The default branch first though it has the fewest runs, pull requests last
+	// though they have the most.
+	if !got[0].DefaultBranch || got[1].Event != "push" || got[2].Event != "pull_request" {
+		t.Errorf("order = %+v, want default branch, then the other push, then pull requests", got)
 	}
 }
 

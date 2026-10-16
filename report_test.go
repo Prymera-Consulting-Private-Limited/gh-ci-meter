@@ -82,6 +82,23 @@ func TestJSONCarriesDurationsAsSeconds(t *testing.T) {
 	}
 }
 
+func TestPullRequestCancellationsAreCalledHarmlessOnlyWhenThereAreSome(t *testing.T) {
+	report := sampleReport()
+
+	if text := cancelledText(cancelledSection(report)); strings.Contains(text, "normally harmless") {
+		t.Errorf("no pull-request rows, yet: %s", text)
+	}
+
+	report.Cancelled = append(report.Cancelled, cancelledRuns{Workflow: "Tests", Event: "pull_request", Runs: 3})
+	if text := cancelledText(cancelledSection(report)); !strings.Contains(text, "normally harmless") {
+		t.Errorf("pull-request rows without the note: %s", text)
+	}
+}
+
+func cancelledText(s section) string {
+	return strings.Join(s.Lines, " ")
+}
+
 func TestAPublicRepositoryIsWarnedAboutSelfHostedRunners(t *testing.T) {
 	report := sampleReport()
 	report.Private = false

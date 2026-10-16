@@ -63,18 +63,25 @@ func zoneName(loc *time.Location) string {
 
 // costSummary splits GitHub-hosted minutes three ways: charged, free (a public
 // repository, Dependabot, GitHub Pages) and unpriced (a label with no known rate).
+// Charged minutes are split again by where each job ran last. A job whose latest
+// run was on your own runners has already moved, so its cost is a saving made,
+// not one still to make.
 type costSummary struct {
 	Days                 float64    `json:"days"`
 	Hosted               []costLine `json:"hosted"`
 	HostedMinutes        int        `json:"hosted_minutes"`
 	ChargedMinutes       int        `json:"charged_minutes"`
 	HostedUSD            float64    `json:"hosted_usd"`
+	StillHostedMinutes   int        `json:"still_hosted_charged_minutes"`
+	StillHostedUSD       float64    `json:"still_hosted_usd"`
+	StillHostedAtFeeUSD  float64    `json:"still_hosted_minutes_self_hosted_at_proposed_fee_usd"`
+	MovedJobs            []string   `json:"moved_to_self_hosted_jobs"`
+	MovedUSD             float64    `json:"moved_to_self_hosted_usd"`
 	FreeMinutes          int        `json:"free_minutes"`
 	UnpricedLabels       []string   `json:"unpriced_hosted_labels"`
 	UnpricedMinutes      int        `json:"unpriced_hosted_minutes"`
 	SelfHostedMinutes    int        `json:"self_hosted_minutes"`
 	SelfHostedAtFeeUSD   float64    `json:"self_hosted_usd_at_proposed_fee"`
-	ChargedMovedAtFeeUSD float64    `json:"charged_minutes_self_hosted_at_proposed_fee_usd"`
 	RatesCheckedOn       string     `json:"rates_checked_on"`
 	RatesSource          string     `json:"rates_source"`
 	FreeUsageSource      string     `json:"free_usage_source"`
@@ -285,8 +292,10 @@ func costOf(records []jobRecord, overrides map[string]float64, window time.Durat
 		ProposedFeeSource:    proposedFeeSource,
 	}
 
+	stillHosted := lastRanHosted(records)
 	lines := map[string]*costLine{}
 	unpriced := map[string]bool{}
+	moved := map[string]bool{}
 	for _, job := range records {
 		if !job.ran() {
 			continue
@@ -327,7 +336,15 @@ func costOf(records []jobRecord, overrides map[string]float64, window time.Durat
 			continue
 		}
 		summary.ChargedMinutes += minutes
-		line.USD += float64(minutes) * r.USDPerMinute
+		usd := float64(minutes) * r.USDPerMinute
+		line.USD += usd
+		if stillHosted[job.key()] {
+			summary.StillHostedMinutes += minutes
+			summary.StillHostedUSD += usd
+		} else {
+			summary.MovedUSD += usd
+			moved[job.key()] = true
+		}
 	}
 
 	for _, line := range lines {
@@ -344,10 +361,31 @@ func costOf(records []jobRecord, overrides map[string]float64, window time.Durat
 		summary.UnpricedLabels = append(summary.UnpricedLabels, labels)
 	}
 	slices.Sort(summary.UnpricedLabels)
+	for key := range moved {
+		summary.MovedJobs = append(summary.MovedJobs, key)
+	}
+	slices.Sort(summary.MovedJobs)
 
 	summary.SelfHostedAtFeeUSD = float64(summary.SelfHostedMinutes) * proposedSelfHostedFee
-	summary.ChargedMovedAtFeeUSD = float64(summary.ChargedMinutes) * proposedSelfHostedFee
+	summary.StillHostedAtFeeUSD = float64(summary.StillHostedMinutes) * proposedSelfHostedFee
 	return summary
+}
+
+// lastRanHosted says, for each job, whether its most recent run in the window
+// was on GitHub's runners.
+func lastRanHosted(records []jobRecord) map[string]bool {
+	latest := map[string]time.Time{}
+	hosted := map[string]bool{}
+	for _, job := range records {
+		if !job.ran() {
+			continue
+		}
+		if last, seen := latest[job.key()]; !seen || job.Started.After(last) {
+			latest[job.key()] = job.Started
+			hosted[job.key()] = job.Hosted
+		}
+	}
+	return hosted
 }
 
 func statsByJob(records []jobRecord) []jobStats {
@@ -575,7 +613,10 @@ func laneCandidates(stats []jobStats, keys []string, waits []time.Duration, runn
 }
 
 // cancelledBeforeStart counts runs that were cancelled before any of their jobs
-// reached a runner.
+// reached a runner. The default branch comes first and pull requests last: a
+// commit on the default branch that is never tested is the loss worth reading
+// about, while a pull request's older commit being replaced by its newer one is
+// usually the point.
 func cancelledBeforeStart(runs []runWithJobs, defaultBranch string) []cancelledRuns {
 	type key struct {
 		workflow, event string
@@ -598,10 +639,17 @@ func cancelledBeforeStart(runs []runWithJobs, defaultBranch string) []cancelledR
 		cancelled = append(cancelled, cancelledRuns{Workflow: k.workflow, Event: k.event, DefaultBranch: k.onDefault, Runs: n})
 	}
 	sort.Slice(cancelled, func(a, b int) bool {
-		if cancelled[a].Runs != cancelled[b].Runs {
-			return cancelled[a].Runs > cancelled[b].Runs
+		x, y := cancelled[a], cancelled[b]
+		if x.DefaultBranch != y.DefaultBranch {
+			return x.DefaultBranch
 		}
-		return cancelled[a].Workflow < cancelled[b].Workflow
+		if xPR, yPR := x.Event == "pull_request", y.Event == "pull_request"; xPR != yPR {
+			return yPR
+		}
+		if x.Runs != y.Runs {
+			return x.Runs > y.Runs
+		}
+		return x.Workflow < y.Workflow
 	})
 	return cancelled
 }
