@@ -5,9 +5,9 @@ set up runners of your own.
 
 One command reads the last 30 days of your workflow runs and tells you:
 
-1. **Minutes and cost.** What your GitHub-hosted minutes cost at list price, and
-   what your self-hosted minutes would cost if GitHub's postponed self-hosted
-   charge came back.
+1. **Minutes and cost.** What your GitHub-hosted minutes cost at list price, what
+   moving the jobs still on them would save, and what your self-hosted minutes
+   would cost if GitHub's postponed self-hosted charge came back.
 2. **Waiting against running.** For each job, how long it waited for a runner
    against how long it ran. A job that waits longer than it runs is stuck in a queue.
 3. **Busiest hours.** When the work actually arrives. Runners that look idle on
@@ -18,7 +18,8 @@ One command reads the last 30 days of your workflow runs and tells you:
 5. **Lane candidates.** Quick jobs, a linter say, that would wait behind long ones
    on runners of your own, and how many runners a lane for them saves.
 6. **Runs cancelled before they started.** Runs that a concurrency group quietly
-   replaced, leaving commits that were never tested on their own.
+   replaced. On the default branch that leaves commits never tested on their own;
+   on a pull request it is usually what you want.
 
 ## Install
 
@@ -77,6 +78,10 @@ gh ci-meter acme/widgets --rate linux-8-core=0.022
   in a public repository and for Dependabot and GitHub Pages anywhere, and the
   report lists those minutes at no cost; larger runners are always charged.
   Larger runners carry labels their owners choose, so price them with `--rate`.
+- **Savings** count only the jobs whose latest run in the window was on GitHub's
+  runners. A job that has since moved to your own is listed as already moved, with
+  what its earlier runs cost, so a window that spans a move does not promise a
+  saving you have already made.
 - **The self-hosted charge.** GitHub
   [announced](https://github.blog/changelog/2025-12-16-coming-soon-simpler-pricing-and-a-better-experience-for-github-actions/)
   a charge of $0.002 a minute for self-hosted runners from 1 March 2026, then

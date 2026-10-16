@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -178,10 +179,15 @@ func costSection(report Report) section {
 			perThirtyDays(cost.SelfHostedAtFeeUSD, cost.Days), cost.ProposedFeePerMinute))
 	}
 
-	if cost.HostedUSD > 0 {
+	if cost.StillHostedUSD > 0 {
 		s.Lines = append(s.Lines, fmt.Sprintf(
-			"Moving the GitHub-hosted jobs you pay for to your own runners would save about %s per 30 days today, or %s if the self-hosted charge came back, provided they run as fast there.",
-			formatUSD(cost.HostedUSD*per30), formatUSD((cost.HostedUSD-cost.ChargedMovedAtFeeUSD)*per30)))
+			"Moving the GitHub-hosted jobs you still pay for to your own runners would save about %s per 30 days today, or %s if the self-hosted charge came back, provided they run as fast there.",
+			formatUSD(cost.StillHostedUSD*per30), formatUSD((cost.StillHostedUSD-cost.StillHostedAtFeeUSD)*per30)))
+	}
+	if len(cost.MovedJobs) > 0 {
+		s.Lines = append(s.Lines, fmt.Sprintf(
+			"Already moved to your own runners: %s. Their runs on GitHub's runners earlier in this window cost %s at list price, and that spending has stopped.",
+			listOf(cost.MovedJobs, 3), formatUSD(cost.MovedUSD)))
 	}
 
 	s.Notes = []string{
@@ -350,7 +356,17 @@ func cancelledSection(report Report) section {
 
 	s.Lines = []string{"Runs cancelled before any of their jobs reached a runner. The usual cause is a concurrency group: " +
 		"it holds one running and one waiting run, and a newer run replaces the waiting one, even with cancel-in-progress: false. " +
-		"The commit in between is then never tested on its own. A manual cancel looks the same; GitHub does not record which it was."}
+		"A manual cancel looks the same; GitHub does not record which it was."}
+	onDefault := slices.ContainsFunc(report.Cancelled, func(c cancelledRuns) bool { return c.DefaultBranch })
+	onPullRequests := slices.ContainsFunc(report.Cancelled, func(c cancelledRuns) bool { return c.Event == "pull_request" })
+	if onDefault {
+		s.Lines = append(s.Lines, "On the default branch it matters: the commit in between is never tested on its own, "+
+			"even though the newer run tests a branch that contains it.")
+	}
+	if onPullRequests {
+		s.Lines = append(s.Lines, "Pull-request rows are normally harmless: a newer push to the same pull request replaced an older one, "+
+			"and only its latest commit needs testing.")
+	}
 	s.Table = &table{Header: []string{"Workflow", "Event", "Branch", "Runs"}}
 	for _, c := range report.Cancelled {
 		branch := "other"
@@ -396,6 +412,14 @@ func formatUSD(usd float64) string {
 
 func trimFloat(f float64) string {
 	return strings.TrimSuffix(fmt.Sprintf("%.1f", f), ".0")
+}
+
+// listOf names the first few items and counts the rest.
+func listOf(items []string, limit int) string {
+	if len(items) <= limit {
+		return strings.Join(items, ", ")
+	}
+	return fmt.Sprintf("%s and %d more", strings.Join(items[:limit], ", "), len(items)-limit)
 }
 
 func shorten(s string, limit int) string {
