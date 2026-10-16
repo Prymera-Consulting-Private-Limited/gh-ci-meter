@@ -219,6 +219,23 @@ func (f *fetcher) runJobs(run workflowRun) ([]workflowJob, error) {
 	return jobs, nil
 }
 
+// uncachedRuns counts the runs whose jobs still have to be read from GitHub,
+// which is about how many API calls the report will make.
+func (f *fetcher) uncachedRuns(runs []workflowRun) int {
+	uncached := 0
+	for _, run := range runs {
+		path := f.cacheFile(run)
+		if path == "" {
+			uncached++
+			continue
+		}
+		if _, err := os.Stat(path); err != nil {
+			uncached++
+		}
+	}
+	return uncached
+}
+
 func (f *fetcher) cacheFile(run workflowRun) string {
 	if f.cacheDir == "" {
 		return ""

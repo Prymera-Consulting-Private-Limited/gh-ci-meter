@@ -47,15 +47,24 @@ gh ci-meter acme/widgets --rate linux-8-core=0.022
 | `--max-runners` | `10` | The largest pool to try. |
 | `--rate LABEL=USD` | | The per-minute price of a runner label the built-in table does not know, such as a larger runner's. Repeat for more. |
 | `--no-cache` | off | Read every run's jobs from GitHub again. |
+| `--wait` | off | When the API allowance runs out, wait for it to reset and carry on. |
 
 ## How it works, and what it assumes
 
 - **What it reads.** Every completed run in the window, then each run's jobs,
-  re-runs included: about one API call per run, against GitHub's 5,000 an hour.
-  Busy days are split so that GitHub's 1,000-run limit on a listing never cuts
-  any off. A finished run's jobs never change, so they are cached
-  (`~/Library/Caches/gh-ci-meter` on macOS, `~/.cache/gh-ci-meter` on Linux) and
-  a second report over the same days costs almost nothing.
+  re-runs included: about one API call per run. Busy days are split so that
+  GitHub's 1,000-run limit on a listing never cuts any off. A finished run's jobs
+  never change, so they are cached (`~/Library/Caches/gh-ci-meter` on macOS,
+  `~/.cache/gh-ci-meter` on Linux) and a second report over the same days costs
+  almost nothing.
+- **The API allowance.** Your `gh` login gets 5,000 API calls an hour, shared by
+  every `gh` command and extension you run. A busy repository can run more than a
+  thousand workflow runs a day, so a 30-day report can need tens of thousands.
+  After listing the runs, and before reading any jobs, the tool counts the calls it
+  needs. If they would leave less than a tenth of your allowance, it stops and says
+  which `--days` would fit. With `--wait` it reads at GitHub's pace instead,
+  waiting as long as GitHub asks whenever the allowance runs out. A passing server
+  error from GitHub is retried a few times before the report gives up.
 - **Wait** is the time from GitHub queueing a job to a runner picking it up.
   GitHub creates a job only once the jobs it `needs:` have finished, so the wait
   is time spent queueing, not time spent on earlier jobs. Time held for an

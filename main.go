@@ -39,6 +39,7 @@ type options struct {
 	MaxRunners int
 	Rates      rateFlag
 	NoCache    bool
+	Wait       bool
 }
 
 // rateFlag collects --rate LABEL=USD, the per-minute price of a runner label
@@ -91,13 +92,14 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("cannot reach GitHub through gh (run `gh auth login` first): %w", err)
 	}
 
+	progress := func(format string, args ...any) {
+		fmt.Fprintf(stderr, "\r"+format+"\033[K", args...)
+	}
 	f := &fetcher{
-		client:   client,
+		client:   &pacedClient{client: client, wait: opts.Wait, notify: progress, sleep: time.Sleep, now: time.Now},
 		repo:     repo,
 		cacheDir: cacheDir(opts.NoCache),
-		progress: func(format string, args ...any) {
-			fmt.Fprintf(stderr, "\r"+format+"\033[K", args...)
-		},
+		progress: progress,
 	}
 
 	to := time.Now().UTC().Truncate(time.Second)
@@ -109,6 +111,10 @@ func run(args []string, stdout, stderr io.Writer) error {
 	}
 	runs, err := f.completedRuns(from, to)
 	if err != nil {
+		return err
+	}
+	if err := checkAllowance(f, runs, opts, stderr); err != nil {
+		fmt.Fprint(stderr, "\r\033[K")
 		return err
 	}
 	withJobs, err := f.jobsOf(runs)
@@ -124,6 +130,27 @@ func run(args []string, stdout, stderr io.Writer) error {
 		Rates:      opts.Rates,
 	})
 	return writeReport(stdout, report, opts.Format)
+}
+
+// checkAllowance stops a report that would use up the API allowance before it
+// reads a single job, unless --wait says to sit the limit out. GitHub Enterprise
+// Server can run without rate limits, and then has no rate_limit endpoint to
+// ask, so a failed lookup skips the check rather than the report.
+func checkAllowance(f *fetcher, runs []workflowRun, opts options, stderr io.Writer) error {
+	left, err := f.allowance()
+	if err != nil {
+		return nil
+	}
+	plan := planFetch(f.uncachedRuns(runs), opts.Days, left)
+	if plan.Fits {
+		return nil
+	}
+	if !opts.Wait {
+		return errors.New(plan.refusal(left))
+	}
+	fmt.Fprintf(stderr, "\r%s API calls to make and %s left until %s: this will wait for GitHub about %d time(s).\033[K\n",
+		formatInt(plan.Calls), formatInt(left.Remaining), left.Reset.Local().Format("15:04"), max(plan.WaitResets, 1))
+	return nil
 }
 
 // parseOptions accepts the repository before or after the flags, as gh's own
@@ -145,6 +172,7 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 	flags.IntVar(&opts.MaxRunners, "max-runners", 10, "largest pool to try when sizing")
 	flags.Var(opts.Rates, "rate", "per-minute price of a runner label, as LABEL=USD; repeat for more")
 	flags.BoolVar(&opts.NoCache, "no-cache", false, "read every run's jobs from GitHub again")
+	flags.BoolVar(&opts.Wait, "wait", false, "when the API allowance runs out, wait for it to reset and carry on")
 
 	if err := flags.Parse(args); err != nil {
 		return opts, err
