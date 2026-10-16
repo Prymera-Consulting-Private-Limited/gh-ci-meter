@@ -1,0 +1,24 @@
+name: release
+
+# Pushing a tag such as v0.1.0 builds the extension for every platform gh runs
+# on and attaches the binaries to a release, which is what
+# `gh extension install` downloads.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cli/gh-extension-precompile@v2
+        with:
+          go_version_file: go.mod
+          generate_attestations: true
