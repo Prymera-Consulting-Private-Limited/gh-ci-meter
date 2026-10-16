@@ -15,17 +15,22 @@ type simJob struct {
 }
 
 // replay runs the jobs, in the order they asked for a runner, on a pool of
-// identical runners that each take one job at a time, and returns how long each
-// job would have waited. A job goes to whichever runner frees up first.
+// identical runners that each take one job at a time. It returns how long each
+// job would have waited, in the order the jobs were given, so a wait can be
+// traced back to its job. A job goes to whichever runner frees up first.
 func replay(jobs []simJob, runners int) []time.Duration {
-	ordered := slices.Clone(jobs)
-	sort.SliceStable(ordered, func(a, b int) bool {
-		return ordered[a].Arrived.Before(ordered[b].Arrived)
+	order := make([]int, len(jobs))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool {
+		return jobs[order[a]].Arrived.Before(jobs[order[b]].Arrived)
 	})
 
 	freeAt := make([]time.Time, runners)
-	waits := make([]time.Duration, len(ordered))
-	for i, job := range ordered {
+	waits := make([]time.Duration, len(jobs))
+	for _, i := range order {
+		job := jobs[i]
 		soonest := 0
 		for r := range freeAt {
 			if freeAt[r].Before(freeAt[soonest]) {

@@ -264,7 +264,8 @@ func runnerCountSection(report Report) section {
 	count := report.RunnerCount
 	s := section{
 		Title: "4. How many runners",
-		Lines: []string{"The window's jobs replayed in the order they were queued, on a pool of your own runners that each take one job at a time."},
+		Lines: []string{"The window's jobs replayed in the order they were queued, on a pool of your own runners that each take one job at a time. " +
+			"Dependabot, GitHub Pages and other runs GitHub starts itself are left out: they stay on GitHub's runners whatever your workflows ask for."},
 	}
 
 	header := []string{"Runners", "Median wait", "p90 wait", "Longest wait", "Waits over 5m"}
@@ -310,23 +311,30 @@ func runnerCountSection(report Report) section {
 
 func laneSection(report Report) section {
 	s := section{Title: "5. Lane candidates"}
-	if len(report.Lanes) == 0 {
-		s.Lines = []string{fmt.Sprintf("None: no job that runs in under %s keeps waiting longer than it runs.", formatDuration(duration(laneMaxRun)))}
+	quick := formatDuration(duration(laneMaxRun))
+	checked := report.RunnerCount.LaneCheckRunners
+	switch {
+	case checked == 0:
+		s.Lines = []string{"None needed: one runner of your own already meets the wait target, so a lane has no runner to save."}
+		return s
+	case len(report.Lanes) == 0:
+		s.Lines = []string{fmt.Sprintf(
+			"None: replayed on %d runner(s), one fewer than a shared pool needs, no job that runs in under %s waits longer than it runs.", checked, quick)}
 		return s
 	}
 
 	s.Lines = []string{fmt.Sprintf(
-		"These jobs run in under %s, but one time in ten they wait longer than they run, usually behind longer jobs. "+
-			"A runner that takes only them removes the wait: give it a label of its own (register it with --no-default-labels --labels <lane>) "+
-			"and point the jobs' runs-on at that label.", formatDuration(duration(laneMaxRun)))}
-	s.Notes = []string{"A job moved to a lane during the window still shows here. Measure again over the days since the move."}
-	s.Table = &table{Header: []string{"Workflow / job", "Jobs", "Median run", "Median wait", "p90 wait"}}
+		"Replayed on %d runner(s), one fewer than a shared pool needs, these jobs run in under %s but one time in ten wait longer than they run, behind longer jobs. "+
+			"A runner that takes only them removes the wait and lets the rest share fewer runners (section 4): give it a label of its own "+
+			"(register it with --no-default-labels --labels <lane>) and point the jobs' runs-on at that label.", checked, quick)}
+	s.Notes = []string{"The replay puts every job in one pool, so a job that already has a lane of its own is listed too."}
+	s.Table = &table{Header: []string{"Workflow / job", "Jobs", "Median run", fmt.Sprintf("p90 wait on %d runner(s)", checked), "p90 wait as it ran"}}
 	for _, lane := range report.Lanes {
 		s.Table.Rows = append(s.Table.Rows, []string{
 			shorten(lane.key(), 48),
 			formatInt(lane.Count),
 			formatDuration(lane.MedianRun),
-			formatDuration(lane.MedianWait),
+			formatDuration(lane.ReplayP90Wait),
 			formatDuration(lane.P90Wait),
 		})
 	}
