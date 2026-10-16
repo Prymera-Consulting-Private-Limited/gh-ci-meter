@@ -127,22 +127,76 @@ func TestJobsThatNeverReachedARunnerAreNotCounted(t *testing.T) {
 	}
 }
 
-func TestLaneCandidateIsQuickButOneTimeInTenWaitsLongerThanItRuns(t *testing.T) {
-	stats := []jobStats{
-		// A short median wait can hide a bad queue: this window held days on
-		// GitHub's runners (no wait) and days behind one shared runner.
-		{Workflow: "Pint", Job: "Pint", MedianRun: duration(24 * time.Second), P90Run: duration(28 * time.Second),
-			MedianWait: duration(3 * time.Second), P90Wait: duration(mins(17))},
-		{Workflow: "Tests", Job: "PHPUnit", MedianRun: duration(mins(8)), P90Run: duration(mins(9)),
-			MedianWait: duration(mins(3)), P90Wait: duration(mins(9))},
-		{Workflow: "Docs", Job: "links", MedianRun: duration(30 * time.Second), P90Run: duration(40 * time.Second),
-			MedianWait: duration(5 * time.Second), P90Wait: duration(8 * time.Second)},
+// burstyHistory is the shape that wants a lane: every ten minutes two
+// eight-minute suites and a twenty-second lint job are queued together. Shared,
+// two runners keep the suites moving but leave the lint job seven and a half
+// minutes behind them; three runners, or two plus a lane, keep everything moving.
+func burstyHistory(hosted bool) []runWithJobs {
+	var runs []runWithJobs
+	for cycle := range 20 {
+		start := mins(10 * float64(cycle))
+		runs = append(runs, oneRun(
+			ranJob("Tests", "suite", start, 0, mins(8), hosted),
+			ranJob("Tests", "suite", start, 0, mins(8), hosted),
+			ranJob("Lint", "lint", start+30*time.Second, 0, 20*time.Second, hosted),
+		))
 	}
+	return runs
+}
 
-	lanes := laneCandidates(stats)
+func TestALaneIsFoundFromTheReplayEvenWhenNoJobEverWaited(t *testing.T) {
+	// On GitHub's runners no job queues behind another, so the waits as they ran
+	// are all zero. The lane has to come from the replay.
+	records := jobRecords(burstyHistory(true))
 
-	if len(lanes) != 1 || lanes[0].Job != "Pint" {
-		t.Errorf("lanes = %v, want only Pint", lanes)
+	count, lanes := runnerCountFor(records, statsByJob(records), analysisOptions{TargetWait: time.Minute, MaxRunners: 10})
+
+	if count.Suggested != 3 || count.SuggestedWithLane != 2 {
+		t.Errorf("suggested %d shared and %d with a lane, want 3 and 2", count.Suggested, count.SuggestedWithLane)
+	}
+	if len(lanes) != 1 || lanes[0].Job != "lint" {
+		t.Fatalf("lanes = %+v, want only the lint job", lanes)
+	}
+	if lanes[0].ReplayRunners != 2 || time.Duration(lanes[0].ReplayP90Wait) != mins(7.5) {
+		t.Errorf("lint replayed on %d runners waits %v, want 2 and 7m30s", lanes[0].ReplayRunners, time.Duration(lanes[0].ReplayP90Wait))
+	}
+	if time.Duration(lanes[0].P90Wait) != 0 {
+		t.Errorf("as it ran the lint job waited %v, want 0", time.Duration(lanes[0].P90Wait))
+	}
+}
+
+func TestRunsGitHubStartsItselfAreLeftOutOfTheReplay(t *testing.T) {
+	runs := burstyHistory(false)
+	for cycle := range 20 {
+		start := mins(10*float64(cycle)) + 30*time.Second
+		runs = append(runs, runWithJobs{
+			Run:  workflowRun{Name: "npm in / - Update", Event: "dynamic", Path: "dynamic/dependabot/dependabot-updates", Conclusion: "success"},
+			Jobs: []workflowJob{ranJob("npm in / - Update", "Dependabot", start, 0, mins(1), true)},
+		})
+	}
+	records := jobRecords(runs)
+
+	count, lanes := runnerCountFor(records, statsByJob(records), analysisOptions{TargetWait: time.Minute, MaxRunners: 10})
+
+	if count.Suggested != 3 || count.SuggestedWithLane != 2 {
+		t.Errorf("suggested %d shared and %d with a lane, want the same 3 and 2 as without Dependabot", count.Suggested, count.SuggestedWithLane)
+	}
+	if len(lanes) != 1 || lanes[0].Job != "lint" {
+		t.Errorf("lanes = %+v, want only the lint job, never Dependabot", lanes)
+	}
+}
+
+func TestNoLaneIsLookedForWhenOneRunnerIsEnough(t *testing.T) {
+	runs := []runWithJobs{oneRun(
+		ranJob("Tests", "suite", 0, 0, mins(8), false),
+		ranJob("Lint", "lint", mins(30), 0, 20*time.Second, false),
+	)}
+	records := jobRecords(runs)
+
+	count, lanes := runnerCountFor(records, statsByJob(records), analysisOptions{TargetWait: time.Minute, MaxRunners: 10})
+
+	if count.Suggested != 1 || count.LaneCheckRunners != 0 || len(lanes) != 0 {
+		t.Errorf("suggested %d, checked lanes on %d, lanes %v; want 1, 0 and none", count.Suggested, count.LaneCheckRunners, lanes)
 	}
 }
 
@@ -188,7 +242,9 @@ func TestRunnerCountFindsTheSmallestPoolThatMeetsTheTarget(t *testing.T) {
 		ranJob("Tests", "c", 0, mins(16), mins(8), false),
 	)}
 
-	count := runnerCountFor(jobRecords(runs), nil, analysisOptions{TargetWait: time.Minute, MaxRunners: 10})
+	records := jobRecords(runs)
+
+	count, lanes := runnerCountFor(records, statsByJob(records), analysisOptions{TargetWait: time.Minute, MaxRunners: 10})
 
 	if count.Suggested != 3 {
 		t.Errorf("suggested = %d, want 3", count.Suggested)
@@ -199,27 +255,22 @@ func TestRunnerCountFindsTheSmallestPoolThatMeetsTheTarget(t *testing.T) {
 	if got := time.Duration(count.Scenarios[0].Shared.Max); got != mins(16) {
 		t.Errorf("longest wait on one runner = %v, want 16m", got)
 	}
+	if len(lanes) != 0 {
+		t.Errorf("lanes = %v, want none: an eight-minute job is not quick", lanes)
+	}
 }
 
-func TestRunnerCountWithALaneTakesTheQuickJobsOutOfTheQueue(t *testing.T) {
-	runs := []runWithJobs{oneRun(
-		ranJob("Tests", "suite", 0, 0, mins(8), false),
-		ranJob("Pint", "Pint", 0, mins(8), 20*time.Second, false),
-	)}
-	records := jobRecords(runs)
-	lanes := []jobStats{{Workflow: "Pint", Job: "Pint"}}
+func TestWithALaneTheQuickJobsStopWaitingAndThePoolShrinks(t *testing.T) {
+	records := jobRecords(burstyHistory(false))
 
-	count := runnerCountFor(records, lanes, analysisOptions{TargetWait: time.Minute, MaxRunners: 10})
+	count, _ := runnerCountFor(records, statsByJob(records), analysisOptions{TargetWait: time.Minute, MaxRunners: 10})
 
-	first := count.Scenarios[0]
-	if time.Duration(first.Shared.Max) != mins(8) {
-		t.Errorf("shared longest wait = %v, want 8m", time.Duration(first.Shared.Max))
+	two := count.Scenarios[1]
+	if time.Duration(two.Shared.P90) != mins(7.5) {
+		t.Errorf("two shared runners: p90 wait %v, want 7m30s", time.Duration(two.Shared.P90))
 	}
-	if first.WithLane == nil || time.Duration(first.WithLane.Max) != 0 {
-		t.Errorf("with a lane = %+v, want no wait", first.WithLane)
-	}
-	if count.SuggestedWithLane != 1 {
-		t.Errorf("suggested with a lane = %d, want 1", count.SuggestedWithLane)
+	if two.WithLane == nil || time.Duration(two.WithLane.Max) != 0 {
+		t.Errorf("two runners plus a lane: %+v, want no wait at all", two.WithLane)
 	}
 }
 

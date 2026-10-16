@@ -49,7 +49,7 @@ func TestReplayGivesEachJobTheRunnerThatFreesFirst(t *testing.T) {
 	}
 }
 
-func TestReplaySortsJobsThatArriveOutOfOrder(t *testing.T) {
+func TestReplayRunsJobsByArrivalButAnswersInTheOrderGiven(t *testing.T) {
 	jobs := []simJob{
 		{Arrived: at(1), Duration: mins(1)},
 		{Arrived: at(0), Duration: mins(5)},
@@ -57,7 +57,8 @@ func TestReplaySortsJobsThatArriveOutOfOrder(t *testing.T) {
 
 	got := replay(jobs, 1)
 
-	want := []time.Duration{0, mins(4)}
+	// The first job given arrived second, so it waits for the other to finish.
+	want := []time.Duration{mins(4), 0}
 	if !slices.Equal(got, want) {
 		t.Errorf("waits = %v, want %v", got, want)
 	}

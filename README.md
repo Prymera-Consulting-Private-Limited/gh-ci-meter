@@ -15,8 +15,8 @@ One command reads the last 30 days of your workflow runs and tells you:
 4. **How many runners.** It replays your real job history on 1, 2, 3… runners of
    your own and finds the smallest pool that keeps nine jobs in ten waiting under
    a minute.
-5. **Lane candidates.** Quick jobs, a linter say, that keep waiting behind long
-   ones and would stop waiting with a runner of their own.
+5. **Lane candidates.** Quick jobs, a linter say, that would wait behind long ones
+   on runners of your own, and how many runners a lane for them saves.
 6. **Runs cancelled before they started.** Runs that a concurrency group quietly
    replaced, leaving commits that were never tested on their own.
 
@@ -86,9 +86,14 @@ gh ci-meter acme/widgets --rate linux-8-core=0.022
   identical runners, each taking one job at a time. It assumes your runners run each
   job as fast as it ran here, and it ignores concurrency groups, which make some
   runs wait whatever the pool size.
-- **A lane candidate** runs in under two minutes but, one time in ten, waits longer
-  than it runs. The slowest tenth is used rather than the median because that is when
-  a merge is held up.
+- **A lane candidate** runs in under two minutes but, replayed on one runner fewer
+  than a shared pool needs, would wait longer than it runs one time in ten. The
+  replay decides it rather than the waits jobs actually had: on GitHub's runners a
+  job never queues behind your other jobs, so its own waits cannot show what would
+  happen on runners of yours. The slowest tenth is used rather than the median
+  because that is when a merge is held up.
+- **Runs GitHub starts itself**, such as Dependabot and GitHub Pages, are left out
+  of the replay. They stay on GitHub's runners whatever your workflows ask for.
 
 ## Before you run your own runners
 

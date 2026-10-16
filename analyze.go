@@ -10,11 +10,15 @@ import (
 	"time"
 )
 
-// A job is a lane candidate when it is quick but, one time in ten, waits longer
-// for a runner than it runs: it is queuing behind longer jobs. The slowest tenth
-// is used rather than the median because that is when a merge is held up, and
-// because a window that spans a change of runners can hide a bad queue behind a
-// good median.
+// A lane candidate is a quick job that, replayed on one runner fewer than a
+// shared pool needs, would wait longer than it runs one time in ten: it would be
+// queuing behind longer jobs, and a runner of its own would let the pool shrink.
+//
+// The replay decides it, not the waits the job actually had. On GitHub's runners
+// a job never queues behind your other jobs, so its own waits cannot show what
+// would happen on runners of yours, and a window spanning a move to your own
+// runners mixes the two. The slowest tenth is used rather than the median
+// because that is when a merge is held up.
 const (
 	laneMaxRun  = 2 * time.Minute
 	laneMinWait = time.Minute
@@ -41,7 +45,7 @@ type Report struct {
 	BusiestHours  []hourStats     `json:"busiest_hours"`
 	SelfHosted    *selfHostedUse  `json:"self_hosted_use,omitempty"`
 	RunnerCount   runnerCount     `json:"runner_count"`
-	Lanes         []jobStats      `json:"lane_candidates"`
+	Lanes         []laneCandidate `json:"lane_candidates"`
 	Cancelled     []cancelledRuns `json:"cancelled_before_start"`
 	Warnings      []string        `json:"warnings"`
 
@@ -122,8 +126,18 @@ type runnerCount struct {
 	TargetP90         duration   `json:"target_p90_wait_seconds"`
 	Suggested         int        `json:"suggested_runners"`
 	SuggestedWithLane int        `json:"suggested_runners_with_lane"`
+	LaneCheckRunners  int        `json:"lane_check_runners"`
 	LaneJobs          []string   `json:"lane_jobs"`
 	Scenarios         []scenario `json:"scenarios"`
+}
+
+// laneCandidate is a quick job that would queue behind longer ones on runners
+// of your own: one time in ten it waits ReplayP90Wait in the replay on
+// ReplayRunners runners. Its own waits, as it really ran, are in jobStats.
+type laneCandidate struct {
+	jobStats
+	ReplayRunners int      `json:"replayed_on_runners"`
+	ReplayP90Wait duration `json:"replayed_p90_wait_seconds"`
 }
 
 // scenario is one pool size. WithLane gives the lane jobs one runner of their
@@ -146,12 +160,15 @@ type jobRecord struct {
 	Workflow    string
 	Name        string
 	FreeBecause string // the GitHub service whose standard-runner minutes are free, if any
-	Hosted      bool
-	Labels      []string
-	Runner      string
-	Queued      time.Time
-	Started     time.Time
-	Finished    time.Time
+	// StartedByGitHub marks Dependabot, GitHub Pages and the other runs GitHub
+	// starts itself. Changing runs-on in your workflows does not move them.
+	StartedByGitHub bool
+	Hosted          bool
+	Labels          []string
+	Runner          string
+	Queued          time.Time
+	Started         time.Time
+	Finished        time.Time
 }
 
 // ran says whether a runner picked the job up and finished it. A skipped job,
@@ -207,8 +224,7 @@ func analyze(info repoInfo, runs []runWithJobs, from, to time.Time, opts analysi
 		SelfHosted:    selfHostedUseOf(records, to),
 		Cancelled:     cancelledBeforeStart(runs, info.DefaultBranch),
 	}
-	report.Lanes = laneCandidates(report.JobStats)
-	report.RunnerCount = runnerCountFor(records, report.Lanes, opts)
+	report.RunnerCount, report.Lanes = runnerCountFor(records, report.JobStats, opts)
 	report.Warnings = warningsFor(report)
 	return report
 }
@@ -228,15 +244,16 @@ func jobRecords(runs []runWithJobs) []jobRecord {
 				workflow = r.Run.Name
 			}
 			records = append(records, jobRecord{
-				Workflow:    workflow,
-				Name:        job.Name,
-				FreeBecause: freeService(r.Run),
-				Hosted:      isHosted(job),
-				Labels:      job.Labels,
-				Runner:      job.RunnerName,
-				Queued:      job.CreatedAt,
-				Started:     job.StartedAt,
-				Finished:    job.CompletedAt,
+				Workflow:        workflow,
+				Name:            job.Name,
+				FreeBecause:     freeService(r.Run),
+				StartedByGitHub: r.Run.Event == "dynamic",
+				Hosted:          isHosted(job),
+				Labels:          job.Labels,
+				Runner:          job.RunnerName,
+				Queued:          job.CreatedAt,
+				Started:         job.StartedAt,
+				Finished:        job.CompletedAt,
 			})
 		}
 	}
@@ -469,70 +486,92 @@ func selfHostedUseOf(records []jobRecord, to time.Time) *selfHostedUse {
 	return &selfHostedUse{Runners: len(firstJob), BusyShare: busy.Seconds() / capacity.Seconds()}
 }
 
-func laneCandidates(stats []jobStats) []jobStats {
-	var lanes []jobStats
-	for _, s := range stats {
-		run, slowRun, slowWait := time.Duration(s.MedianRun), time.Duration(s.P90Run), time.Duration(s.P90Wait)
-		if run <= laneMaxRun && slowWait >= laneMinWait && slowWait > slowRun {
-			lanes = append(lanes, s)
+// runnerCountFor replays the window's jobs on 1, 2, 3... runners of your own
+// and stops at the first pool size that meets the target. It then looks for
+// lane candidates on the largest pool that fell short, and sizes each pool again
+// with those jobs on a runner of their own. Runs GitHub starts itself stay on
+// GitHub's runners, so they are left out.
+func runnerCountFor(records []jobRecord, stats []jobStats, opts analysisOptions) (runnerCount, []laneCandidate) {
+	var jobs []simJob
+	var keys []string
+	for _, job := range records {
+		if job.ran() && !job.StartedByGitHub {
+			jobs = append(jobs, simJob{Arrived: job.Queued, Duration: job.duration()})
+			keys = append(keys, job.key())
 		}
 	}
-	return lanes
-}
 
-// runnerCountFor replays the window's jobs on 1, 2, 3... runners of your own
-// and stops at the first pool size that meets the target, with and without a
-// lane for the lane candidates.
-func runnerCountFor(records []jobRecord, lanes []jobStats, opts analysisOptions) runnerCount {
-	inLane := map[string]bool{}
 	result := runnerCount{TargetP90: duration(opts.TargetWait)}
+	var waitsByPool [][]time.Duration
+	for n := 1; n <= opts.MaxRunners; n++ {
+		waits := replay(jobs, n)
+		waitsByPool = append(waitsByPool, waits)
+		shared := summariseWaits(waits)
+		result.Scenarios = append(result.Scenarios, scenario{Runners: n, Shared: shared})
+		if time.Duration(shared.P90) <= opts.TargetWait {
+			result.Suggested = n
+			break
+		}
+	}
+
+	// When one runner already meets the target there is no runner for a lane
+	// to save, so there is nothing to look for.
+	result.LaneCheckRunners = len(waitsByPool)
+	if result.Suggested > 0 {
+		result.LaneCheckRunners = result.Suggested - 1
+	}
+	if result.LaneCheckRunners == 0 {
+		return result, nil
+	}
+	lanes := laneCandidates(stats, keys, waitsByPool[result.LaneCheckRunners-1], result.LaneCheckRunners)
+	if len(lanes) == 0 {
+		return result, nil
+	}
+
+	inLane := map[string]bool{}
 	for _, lane := range lanes {
 		inLane[lane.key()] = true
 		result.LaneJobs = append(result.LaneJobs, lane.key())
 	}
-
-	var all, laneJobs, otherJobs []simJob
-	for _, job := range records {
-		if !job.ran() {
-			continue
-		}
-		s := simJob{Arrived: job.Queued, Duration: job.duration()}
-		all = append(all, s)
-		if inLane[job.key()] {
-			laneJobs = append(laneJobs, s)
+	var laneJobs, otherJobs []simJob
+	for i, job := range jobs {
+		if inLane[keys[i]] {
+			laneJobs = append(laneJobs, job)
 		} else {
-			otherJobs = append(otherJobs, s)
+			otherJobs = append(otherJobs, job)
 		}
 	}
 
-	var laneWaits []time.Duration
-	if len(laneJobs) > 0 {
-		laneWaits = replay(laneJobs, 1)
-	}
-
-	for n := 1; n <= opts.MaxRunners; n++ {
-		s := scenario{Runners: n, Shared: summariseWaits(replay(all, n))}
-		sharedMet := time.Duration(s.Shared.P90) <= opts.TargetWait
-		if sharedMet && result.Suggested == 0 {
-			result.Suggested = n
-		}
-
-		laneMet := true
-		if len(laneJobs) > 0 {
-			withLane := summariseWaits(append(slices.Clone(laneWaits), replay(otherJobs, n)...))
-			s.WithLane = &withLane
-			laneMet = time.Duration(withLane.P90) <= opts.TargetWait
-			if laneMet && result.SuggestedWithLane == 0 {
-				result.SuggestedWithLane = n
-			}
-		}
-
-		result.Scenarios = append(result.Scenarios, s)
-		if sharedMet && laneMet {
-			break
+	laneWaits := replay(laneJobs, 1)
+	for i := range result.Scenarios {
+		sc := &result.Scenarios[i]
+		withLane := summariseWaits(append(slices.Clone(laneWaits), replay(otherJobs, sc.Runners)...))
+		sc.WithLane = &withLane
+		if result.SuggestedWithLane == 0 && time.Duration(withLane.P90) <= opts.TargetWait {
+			result.SuggestedWithLane = sc.Runners
 		}
 	}
-	return result
+	return result, lanes
+}
+
+// laneCandidates picks the quick jobs that, one time in ten, wait longer than
+// they run in the replay whose waits are given, one per job named in keys.
+func laneCandidates(stats []jobStats, keys []string, waits []time.Duration, runners int) []laneCandidate {
+	replayed := map[string][]time.Duration{}
+	for i, wait := range waits {
+		replayed[keys[i]] = append(replayed[keys[i]], wait)
+	}
+
+	var lanes []laneCandidate
+	for _, s := range stats {
+		jobWaits := replayed[s.key()]
+		slices.Sort(jobWaits)
+		slowWait := percentile(jobWaits, 0.9)
+		if time.Duration(s.MedianRun) <= laneMaxRun && slowWait >= laneMinWait && slowWait > time.Duration(s.P90Run) {
+			lanes = append(lanes, laneCandidate{jobStats: s, ReplayRunners: runners, ReplayP90Wait: duration(slowWait)})
+		}
+	}
+	return lanes
 }
 
 // cancelledBeforeStart counts runs that were cancelled before any of their jobs
