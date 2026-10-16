@@ -23,7 +23,7 @@ One command reads the last 30 days of your workflow runs and tells you:
 ## Install
 
 ```sh
-gh extension install <owner>/gh-ci-meter
+gh extension install Prymera-Consulting-Private-Limited/gh-ci-meter
 ```
 
 It runs on the [GitHub CLI](https://cli.github.com) and uses its login, so sign

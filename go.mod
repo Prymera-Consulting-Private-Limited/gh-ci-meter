@@ -1,4 +1,4 @@
-module gh-ci-meter
+module github.com/Prymera-Consulting-Private-Limited/gh-ci-meter
 
 go 1.25.0
 
